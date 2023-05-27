@@ -21,8 +21,8 @@ const main = async () => {
     url: pgUrl(env.dbMigrateCreds),
     schema: env.dbSchema,
   })
-  await migrateDb.migrateToLatestOrThrow()
-  await migrateDb.close()
+  // await migrateDb.migrateToLatestOrThrow()
+  // await migrateDb.close()
   // Use lower-credentialed user to run the app
   const db = Database.postgres({
     url: pgUrl(env.dbCreds),
