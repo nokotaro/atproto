@@ -26,7 +26,7 @@ export interface HandlerInput {
 export interface HandlerError {
   status: number
   message?: string
-  error?: 'InvalidSwap'
+  error?: 'InvalidSwap' | 'ConcurrentWrites'
 }
 
 export type HandlerOutput = HandlerError | void

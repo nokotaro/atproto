@@ -29,12 +29,19 @@ export class FeedViews {
   formatFeedGeneratorView(
     info: FeedGenInfo,
     profiles: Record<string, ProfileView>,
+    labels?: Labels,
   ): GeneratorView {
+    const profile = profiles[info.creator]
+    if (profile) {
+      // If the creator labels are not hydrated yet, attempt to pull them
+      // from labels: e.g. compatible with embedsForPosts() batching label hydration.
+      profile.labels ??= labels?.[info.creator] ?? []
+    }
     return {
       uri: info.uri,
       cid: info.cid,
       did: info.feedDid,
-      creator: profiles[info.creator],
+      creator: profile,
       displayName: info.displayName ?? undefined,
       description: info.description ?? undefined,
       descriptionFacets: info.descriptionFacets
@@ -75,10 +82,16 @@ export class FeedViews {
       const feedPost = { post }
       if (item.type === 'repost') {
         const originator = actors[item.originatorDid]
-        if (originator) {
+        // skip over reposts where we don't have reposter profile
+        if (!originator) {
+          continue
+        } else {
           feedPost['reason'] = {
             $type: 'app.bsky.feed.defs#reasonRepost',
-            by: originator,
+            by: {
+              ...originator,
+              labels: labels[item.originatorDid] ?? [],
+            },
             indexedAt: item.sortAt,
           }
         }
@@ -122,6 +135,9 @@ export class FeedViews {
     const post = posts[uri]
     const author = actors[post?.creator]
     if (!post || !author) return undefined
+    // If the author labels are not hydrated yet, attempt to pull them
+    // from labels: e.g. compatible with hydrateFeed() batching label hydration.
+    author.labels ??= labels[author.did] ?? []
     return {
       uri: post.uri,
       cid: post.cid,

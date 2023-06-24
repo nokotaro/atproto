@@ -2,7 +2,10 @@ import { QueryParams as SkeletonParams } from '../lexicon/types/app/bsky/feed/ge
 import AppContext from '../context'
 import { paginate } from '../db/pagination'
 import { AlgoHandler, AlgoResponse } from './types'
-import { FeedKeyset } from '../app-view/api/app/bsky/util/feed'
+import {
+  FeedKeyset,
+  getFeedDateThreshold,
+} from '../app-view/api/app/bsky/util/feed'
 
 const handler: AlgoHandler = async (
   ctx: AppContext,
@@ -28,19 +31,23 @@ const handler: AlgoHandler = async (
     )
     .select('follow.subjectDid')
 
+  const keyset = new FeedKeyset(ref('feed_item.sortAt'), ref('feed_item.cid'))
+  const sortFrom = keyset.unpack(cursor)?.primary
+
   let feedQb = feedService
     .selectFeedItemQb()
+    .where('feed_item.type', '=', 'post') // ensures originatorDid is post.creator
     .where((qb) =>
       qb
-        .where('post.creator', '=', requester)
-        .orWhere('post.creator', 'in', mutualsSubquery),
+        .where('originatorDid', '=', requester)
+        .orWhere('originatorDid', 'in', mutualsSubquery),
     )
     .where((qb) =>
-      accountService.whereNotMuted(qb, requester, [ref('post.creator')]),
+      accountService.whereNotMuted(qb, requester, [ref('originatorDid')]),
     )
-    .whereNotExists(graphService.blockQb(requester, [ref('post.creator')]))
+    .whereNotExists(graphService.blockQb(requester, [ref('originatorDid')]))
+    .where('feed_item.sortAt', '>', getFeedDateThreshold(sortFrom))
 
-  const keyset = new FeedKeyset(ref('feed_item.sortAt'), ref('feed_item.cid'))
   feedQb = paginate(feedQb, { limit, cursor, keyset })
 
   const feedItems = await feedQb.execute()

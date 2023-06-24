@@ -1,4 +1,4 @@
-import { SelectQueryBuilder, WhereInterface, sql } from 'kysely'
+import { WhereInterface, sql } from 'kysely'
 import { dbLogger as log } from '../../logger'
 import Database from '../../db'
 import * as scrypt from '../../db/scrypt'
@@ -50,6 +50,17 @@ export class AccountService {
       .selectAll('repo_root')
       .executeTakeFirst()
     return result || null
+  }
+
+  // Repo exists and is not taken-down
+  async isRepoAvailable(did: string) {
+    const found = await this.db.db
+      .selectFrom('repo_root')
+      .where('did', '=', did)
+      .where('takedownId', 'is', null)
+      .select('did')
+      .executeTakeFirst()
+    return found !== undefined
   }
 
   async getAccountByEmail(
@@ -338,11 +349,23 @@ export class AccountService {
   }
 
   async search(opts: {
+    searchField?: 'did' | 'handle'
     term: string
     limit: number
     cursor?: string
     includeSoftDeleted?: boolean
   }): Promise<(RepoRoot & DidHandle & { distance: number })[]> {
+    if (opts.searchField === 'did') {
+      const didSearchBuilder = this.db.db
+        .selectFrom('did_handle')
+        .where('did_handle.did', '=', opts.term)
+        .innerJoin('repo_root', 'repo_root.did', 'did_handle.did')
+        .selectAll(['did_handle', 'repo_root'])
+        .select(sql<number>`0`.as('distance'))
+
+      return await didSearchBuilder.execute()
+    }
+
     const builder =
       this.db.dialect === 'pg'
         ? getUserSearchQueryPg(this.db, opts)
@@ -356,6 +379,7 @@ export class AccountService {
             .selectAll('did_handle')
             .selectAll('repo_root')
             .select(sql<number>`0`.as('distance'))
+
     return await builder.execute()
   }
 

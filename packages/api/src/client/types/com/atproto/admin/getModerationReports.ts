@@ -10,6 +10,9 @@ import * as ComAtprotoAdminDefs from './defs'
 
 export interface QueryParams {
   subject?: string
+  ignoreSubjects?: string[]
+  /** Filter reports made by one or more DIDs */
+  reporters?: string[]
   resolved?: boolean
   actionType?:
     | 'com.atproto.admin.defs#takedown'
@@ -19,6 +22,8 @@ export interface QueryParams {
     | (string & {})
   limit?: number
   cursor?: string
+  /** Reverse the order of the returned records? when true, returns reports in chronological order */
+  reverse?: boolean
 }
 
 export type InputSchema = undefined

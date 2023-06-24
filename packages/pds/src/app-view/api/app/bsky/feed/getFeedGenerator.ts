@@ -4,16 +4,26 @@ import {
   PoorlyFormattedDidDocumentError,
   getFeedGen,
 } from '@atproto/identity'
-import { AtpAgent } from '@atproto/api'
 import { Server } from '../../../../../lexicon'
 import AppContext from '../../../../../context'
 
 export default function (server: Server, ctx: AppContext) {
   server.app.bsky.feed.getFeedGenerator({
     auth: ctx.accessVerifier,
-    handler: async ({ params, auth }) => {
-      const { feed } = params
+    handler: async ({ req, params, auth }) => {
       const requester = auth.credentials.did
+      if (ctx.canProxy(req)) {
+        const res = await ctx.appviewAgent.api.app.bsky.feed.getFeedGenerator(
+          params,
+          await ctx.serviceAuthHeaders(requester),
+        )
+        return {
+          encoding: 'application/json',
+          body: res.data,
+        }
+      }
+
+      const { feed } = params
 
       const feedService = ctx.services.appView.feed(ctx.db)
 
@@ -46,26 +56,6 @@ export default function (server: Server, ctx: AppContext) {
         )
       }
 
-      let isOnline: boolean
-      let isValid: boolean
-
-      if (ctx.algos[feed]) {
-        isValid = true
-        isOnline = true
-      } else {
-        const agent = new AtpAgent({ service: fgEndpoint })
-        try {
-          const res = await agent.api.app.bsky.feed.describeFeedGenerator()
-          isOnline = true
-          isValid =
-            res.data.did === feedDid &&
-            res.data.feeds.some((f) => f.uri === feed)
-        } catch (err) {
-          isOnline = false
-          isValid = false
-        }
-      }
-
       const profiles = await feedService.getActorViews(
         [feedInfo.creator],
         requester,
@@ -79,8 +69,9 @@ export default function (server: Server, ctx: AppContext) {
         encoding: 'application/json',
         body: {
           view: feedView,
-          isOnline,
-          isValid,
+          // @TODO temporarily hard-coding to true while external feedgens catch-up on describeFeedGenerator
+          isOnline: true,
+          isValid: true,
         },
       }
     },

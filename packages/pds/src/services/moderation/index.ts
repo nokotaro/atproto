@@ -99,8 +99,20 @@ export class ModerationService {
     actionType?: string
     limit: number
     cursor?: string
-  }): Promise<ModerationReportRow[]> {
-    const { subject, resolved, actionType, limit, cursor } = opts
+    ignoreSubjects?: string[]
+    reverse?: boolean
+    reporters?: string[]
+  }): Promise<ModerationReportRowWithHandle[]> {
+    const {
+      subject,
+      resolved,
+      actionType,
+      limit,
+      cursor,
+      ignoreSubjects,
+      reverse = false,
+      reporters,
+    } = opts
     const { ref } = this.db.db.dynamic
     let builder = this.db.db.selectFrom('moderation_report')
     if (subject) {
@@ -110,6 +122,19 @@ export class ModerationService {
           .orWhere('subjectUri', '=', subject)
       })
     }
+
+    if (ignoreSubjects?.length) {
+      builder = builder.where((qb) => {
+        return qb
+          .where('subjectDid', 'not in', ignoreSubjects)
+          .where('subjectUri', 'not in', ignoreSubjects)
+      })
+    }
+
+    if (reporters?.length) {
+      builder = builder.where('reportedByDid', 'in', reporters)
+    }
+
     if (resolved !== undefined) {
       const resolutionsQuery = this.db.db
         .selectFrom('moderation_report_resolution')
@@ -141,16 +166,19 @@ export class ModerationService {
         .selectAll()
       builder = builder.whereExists(resolutionActionsQuery)
     }
+
     if (cursor) {
       const cursorNumeric = parseInt(cursor, 10)
       if (isNaN(cursorNumeric)) {
         throw new InvalidRequestError('Malformed cursor')
       }
-      builder = builder.where('id', '<', cursorNumeric)
+      builder = builder.where('id', reverse ? '>' : '<', cursorNumeric)
     }
+
     return await builder
-      .selectAll()
-      .orderBy('id', 'desc')
+      .leftJoin('did_handle', 'did_handle.did', 'moderation_report.subjectDid')
+      .selectAll(['moderation_report', 'did_handle'])
+      .orderBy('id', reverse ? 'asc' : 'desc')
       .limit(limit)
       .execute()
   }
@@ -517,6 +545,9 @@ export class ModerationService {
 export type ModerationActionRow = Selectable<ModerationAction>
 
 export type ModerationReportRow = Selectable<ModerationReport>
+export type ModerationReportRowWithHandle = ModerationReportRow & {
+  handle?: string | null
+}
 
 export type SubjectInfo =
   | {

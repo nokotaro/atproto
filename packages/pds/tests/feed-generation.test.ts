@@ -6,7 +6,7 @@ import basicSeed from './seeds/basic'
 import { TestNetworkNoAppView } from '@atproto/dev-env'
 import { TestFeedGen } from '@atproto/dev-env/src/feed-gen'
 import { TID } from '@atproto/common'
-import { forSnapshot, paginateAll } from './_util'
+import { adminAuth, forSnapshot, paginateAll } from './_util'
 import {
   FeedViewPost,
   GeneratorView,
@@ -14,6 +14,7 @@ import {
 import { SkeletonFeedPost } from '../src/lexicon/types/app/bsky/feed/defs'
 import { RecordRef } from './seeds/client'
 import { ids } from '../src/lexicon/lexicons'
+import { TAKEDOWN } from '@atproto/api/src/client/types/com/atproto/admin/defs'
 
 describe('feed generation', () => {
   let network: TestNetworkNoAppView
@@ -26,6 +27,9 @@ describe('feed generation', () => {
   let feedUriAllRef: RecordRef
   let feedUriEven: string
   let feedUriOdd: string // Unsupported by feed gen
+  let feedUriBadPagination: string
+  let feedUriPrime: string // Taken-down
+  let feedUriPrimeRef: RecordRef
 
   beforeAll(async () => {
     network = await TestNetworkNoAppView.create({
@@ -37,10 +41,18 @@ describe('feed generation', () => {
     await network.pds.ctx.backgroundQueue.processAll()
     alice = sc.dids.alice
     const allUri = AtUri.make(alice, 'app.bsky.feed.generator', 'all')
+    const feedUriBadPagination = AtUri.make(
+      alice,
+      'app.bsky.feed.generator',
+      'bad-pagination',
+    )
     const evenUri = AtUri.make(alice, 'app.bsky.feed.generator', 'even')
+    const primeUri = AtUri.make(alice, 'app.bsky.feed.generator', 'prime')
     gen = await network.createFeedGen({
       [allUri.toString()]: feedGenHandler('all'),
       [evenUri.toString()]: feedGenHandler('even'),
+      [feedUriBadPagination.toString()]: feedGenHandler('bad-pagination'),
+      [primeUri.toString()]: feedGenHandler('prime'),
     })
   })
 
@@ -85,10 +97,51 @@ describe('feed generation', () => {
       },
       sc.getHeaders(alice),
     )
+    const badPagination = await agent.api.app.bsky.feed.generator.create(
+      { repo: alice, rkey: 'bad-pagination' },
+      {
+        did: gen.did,
+        displayName: 'Bad Pagination',
+        description:
+          'Provides all feed candidates, blindly ignoring pagination limit',
+        createdAt: new Date().toISOString(),
+      },
+      sc.getHeaders(alice),
+    )
+    // Taken-down
+    const prime = await agent.api.app.bsky.feed.generator.create(
+      { repo: alice, rkey: 'prime' },
+      {
+        did: gen.did,
+        displayName: 'Prime',
+        description: 'Provides prime-indexed feed candidates',
+        createdAt: new Date().toISOString(),
+      },
+      sc.getHeaders(alice),
+    )
+    await agent.api.com.atproto.admin.takeModerationAction(
+      {
+        action: TAKEDOWN,
+        subject: {
+          $type: 'com.atproto.repo.strongRef',
+          uri: prime.uri,
+          cid: prime.cid,
+        },
+        createdBy: 'did:example:admin',
+        reason: 'Y',
+      },
+      {
+        encoding: 'application/json',
+        headers: { authorization: adminAuth() },
+      },
+    )
     feedUriAll = all.uri
     feedUriAllRef = new RecordRef(all.uri, all.cid)
     feedUriEven = even.uri
     feedUriOdd = odd.uri
+    feedUriBadPagination = badPagination.uri
+    feedUriPrime = prime.uri
+    feedUriPrimeRef = new RecordRef(prime.uri, prime.cid)
   })
 
   it('feed gen records can be updated', async () => {
@@ -124,10 +177,12 @@ describe('feed generation', () => {
 
     const paginatedAll: GeneratorView[] = results(await paginateAll(paginator))
 
-    expect(paginatedAll.length).toEqual(3)
+    expect(paginatedAll.length).toEqual(4)
     expect(paginatedAll[0].uri).toEqual(feedUriOdd)
-    expect(paginatedAll[1].uri).toEqual(feedUriEven)
-    expect(paginatedAll[2].uri).toEqual(feedUriAll)
+    expect(paginatedAll[1].uri).toEqual(feedUriBadPagination)
+    expect(paginatedAll[2].uri).toEqual(feedUriEven)
+    expect(paginatedAll[3].uri).toEqual(feedUriAll)
+    expect(paginatedAll.map((fg) => fg.uri)).not.toContain(feedUriPrime) // taken-down
     expect(forSnapshot(paginatedAll)).toMatchSnapshot()
   })
 
@@ -152,6 +207,27 @@ describe('feed generation', () => {
     expect(forSnapshot(view.data.posts[0])).toMatchSnapshot()
   })
 
+  it('does not embed taken-down feed generator records in posts', async () => {
+    const res = await agent.api.app.bsky.feed.post.create(
+      { repo: sc.dids.bob },
+      {
+        text: 'weird feed',
+        embed: {
+          $type: 'app.bsky.embed.record',
+          record: feedUriPrimeRef.raw,
+        },
+        createdAt: new Date().toISOString(),
+      },
+      sc.getHeaders(sc.dids.bob),
+    )
+    const view = await agent.api.app.bsky.feed.getPosts(
+      { uris: [res.uri] },
+      { headers: sc.getHeaders(sc.dids.bob) },
+    )
+    expect(view.data.posts.length).toBe(1)
+    expect(forSnapshot(view.data.posts[0])).toMatchSnapshot()
+  })
+
   describe('getFeedGenerator', () => {
     it('describes a feed gen & returns online status', async () => {
       const resEven = await agent.api.app.bsky.feed.getFeedGenerator(
@@ -163,7 +239,16 @@ describe('feed generation', () => {
       expect(resEven.data.isValid).toBe(true)
     })
 
-    it('handles an unsupported algo', async () => {
+    it('does not describe taken-down feed', async () => {
+      const tryGetFeed = agent.api.app.bsky.feed.getFeedGenerator(
+        { feed: feedUriPrime },
+        { headers: sc.getHeaders(sc.dids.bob) },
+      )
+      await expect(tryGetFeed).rejects.toThrow('could not find feed')
+    })
+
+    // @TODO temporarily skipping while external feedgens catch-up on describeFeedGenerator
+    it.skip('handles an unsupported algo', async () => {
       const resOdd = await agent.api.app.bsky.feed.getFeedGenerator(
         { feed: feedUriOdd },
         { headers: sc.getHeaders(sc.dids.bob) },
@@ -172,7 +257,8 @@ describe('feed generation', () => {
       expect(resOdd.data.isValid).toBe(false)
     })
 
-    it('handles an offline feed', async () => {
+    // @TODO temporarily skipping while external feedgens catch-up on describeFeedGenerator
+    it.skip('handles an offline feed', async () => {
       // make an invalid feed gen in bob's repo
       const allUriBob = AtUri.make(
         sc.dids.bob,
@@ -211,10 +297,11 @@ describe('feed generation', () => {
   describe('getFeedGenerators', () => {
     it('describes multiple feed gens', async () => {
       const resEven = await agent.api.app.bsky.feed.getFeedGenerators(
-        { feeds: [feedUriEven, feedUriAll] },
+        { feeds: [feedUriEven, feedUriAll, feedUriPrime] },
         { headers: sc.getHeaders(sc.dids.bob) },
       )
       expect(forSnapshot(resEven.data)).toMatchSnapshot()
+      expect(resEven.data.feeds.map((fg) => fg.uri)).not.toContain(feedUriPrime) // taken-down
     })
   })
 
@@ -226,6 +313,7 @@ describe('feed generation', () => {
           { headers: sc.getHeaders(sc.dids.bob) },
         )
       expect(resEven.data.feeds.map((f) => f.likeCount)).toEqual([2, 0, 0, 0])
+      expect(resEven.data.feeds.map((f) => f.uri)).not.toContain(feedUriPrime) // taken-down
     })
   })
 
@@ -266,12 +354,35 @@ describe('feed generation', () => {
       expect(forSnapshot(paginatedAll)).toMatchSnapshot()
     })
 
+    it('paginates, handling feed not respecting limit.', async () => {
+      const res = await agent.api.app.bsky.feed.getFeed(
+        { feed: feedUriBadPagination, limit: 3 },
+        { headers: sc.getHeaders(alice) },
+      )
+      // refused to respect pagination limit, so it got cut short by appview but the cursor remains.
+      expect(res.data.feed.length).toBeLessThanOrEqual(3)
+      expect(parseInt(res.data.cursor || '', 10)).toBeGreaterThanOrEqual(3)
+      expect(res.data.feed.map((item) => item.post.uri)).toEqual([
+        sc.posts[sc.dids.alice][0].ref.uriStr,
+        sc.posts[sc.dids.bob][0].ref.uriStr,
+        sc.posts[sc.dids.carol][0].ref.uriStr,
+      ])
+    })
+
     it('fails on unknown feed.', async () => {
       const tryGetFeed = agent.api.app.bsky.feed.getFeed(
         { feed: feedUriOdd },
         { headers: sc.getHeaders(alice) },
       )
       await expect(tryGetFeed).rejects.toThrow(UnknownFeedError)
+    })
+
+    it('resolves contents of taken-down feed.', async () => {
+      const tryGetFeed = agent.api.app.bsky.feed.getFeed(
+        { feed: feedUriPrime },
+        { headers: sc.getHeaders(alice) },
+      )
+      await expect(tryGetFeed).resolves.toBeDefined()
     })
 
     it('receives proper auth details.', async () => {
@@ -313,7 +424,7 @@ describe('feed generation', () => {
   })
 
   const feedGenHandler =
-    (feedName: 'even' | 'all'): SkeletonHandler =>
+    (feedName: 'even' | 'all' | 'prime' | 'bad-pagination'): SkeletonHandler =>
     async ({ req, params }) => {
       const { limit, cursor } = params
       const candidates: SkeletonFeedPost[] = [
@@ -340,10 +451,19 @@ describe('feed generation', () => {
         },
       ]
       const offset = cursor ? parseInt(cursor, 10) : 0
-      const fullFeed = candidates.filter((_, i) =>
-        feedName === 'even' ? i % 2 === 0 : true,
-      )
-      const feedResults = fullFeed.slice(offset, offset + limit)
+      const fullFeed = candidates.filter((_, i) => {
+        if (feedName === 'even') {
+          return i % 2 === 0
+        }
+        if (feedName === 'prime') {
+          return [2, 3, 5, 7, 11, 13].includes(i)
+        }
+        return true
+      })
+      const feedResults =
+        feedName === 'bad-pagination'
+          ? fullFeed.slice(offset) // does not respect limit
+          : fullFeed.slice(offset, offset + limit)
       const lastResult = feedResults.at(-1)
       return {
         encoding: 'application/json',
