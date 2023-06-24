@@ -11,7 +11,13 @@ require('dd-trace/init') // Only works with commonjs
 
 // Tracer code above must come before anything else
 const path = require('path')
-const { Database, DiskBlobStore, ServerConfig, PDS } = require('@atproto/pds')
+const {
+  Database,
+  ServerConfig,
+  PDS,
+  ViewMaintainer,
+  makeAlgos,
+} = require('@atproto/pds')
 const { Secp256k1Keypair } = require('@atproto/crypto')
 
 const main = async () => {
@@ -24,8 +30,7 @@ const main = async () => {
     // view-maintainer lock then one for anything else.
     poolSize: 2,
   })
-  // await migrateDb.migrateToLatestOrThrow()
-  // await migrateDb.close()
+  await migrateDb.migrateToLatestOrThrow()
   // Use lower-credentialed user to run the app
   const db = Database.postgres({
     url: pgUrl(env.dbCreds),
@@ -52,6 +57,7 @@ const main = async () => {
     imgUriKey: env.imgUrlKey,
     blobCacheLocation: env.blobChacheLoc,
   })
+  const algos = env.feedPublisherDid ? makeAlgos(env.feedPublisherDid) : {}
   const pds = PDS.create({
     db,
     blobstore: pdsBlobstore,
@@ -59,11 +65,17 @@ const main = async () => {
     plcRotationKey,
     config: cfg,
     imgInvalidator: null,
+    algos,
   })
+  const viewMaintainer = new ViewMaintainer(migrateDb)
+  const viewMaintainerRunning = viewMaintainer.run()
   await pds.start()
   // Graceful shutdown (see also https://aws.amazon.com/blogs/containers/graceful-shutdowns-with-ecs/)
   process.on('SIGTERM', async () => {
     await pds.destroy()
+    viewMaintainer.destroy()
+    await viewMaintainerRunning
+    await migrateDb.close()
   })
 }
 
@@ -114,6 +126,7 @@ const getEnv = () => ({
   imgUrlSalt: process.env.IMG_URI_SALT,
   imgUrlKey: process.env.IMG_URI_KEY,
   cfDistributionId: process.env.CF_DISTRIBUTION_ID,
+  feedPublisherDid: process.env.FEED_PUBLISHER_DID,
 })
 
 const maintainXrpcResource = (span, req) => {
