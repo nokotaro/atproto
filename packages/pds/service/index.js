@@ -13,6 +13,7 @@ require('dd-trace/init') // Only works with commonjs
 const path = require('path')
 const {
   Database,
+  DiskBlobStore,
   ServerConfig,
   PDS,
   ViewMaintainer,
