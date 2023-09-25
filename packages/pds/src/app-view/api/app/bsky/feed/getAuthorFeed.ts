@@ -1,95 +1,76 @@
 import { Server } from '../../../../../lexicon'
-import { FeedKeyset } from '../util/feed'
-import { paginate } from '../../../../../db/pagination'
 import AppContext from '../../../../../context'
-import { FeedRow } from '../../../../services/feed'
-import { InvalidRequestError } from '@atproto/xrpc-server'
+import { OutputSchema } from '../../../../../lexicon/types/app/bsky/feed/getAuthorFeed'
+import { handleReadAfterWrite } from '../util/read-after-write'
+import { authPassthru } from '../../../../../api/com/atproto/admin/util'
+import { LocalRecords } from '../../../../../services/local'
+import { isReasonRepost } from '../../../../../lexicon/types/app/bsky/feed/defs'
 
 export default function (server: Server, ctx: AppContext) {
   server.app.bsky.feed.getAuthorFeed({
-    auth: ctx.accessVerifier,
+    auth: ctx.accessOrRoleVerifier,
     handler: async ({ req, params, auth }) => {
-      const requester = auth.credentials.did
-      if (ctx.canProxy(req)) {
-        const res = await ctx.appviewAgent.api.app.bsky.feed.getAuthorFeed(
-          params,
-          await ctx.serviceAuthHeaders(requester),
-        )
-        return {
-          encoding: 'application/json',
-          body: res.data,
-        }
-      }
-
-      const { actor, limit, cursor } = params
-      const db = ctx.db.db
-      const { ref } = db.dynamic
-
-      // first verify there is not a block between requester & subject
-      const blocks = await ctx.services.appView
-        .graph(ctx.db)
-        .getBlocks(requester, actor)
-      if (blocks.blocking) {
-        throw new InvalidRequestError(
-          `Requester has blocked actor: ${actor}`,
-          'BlockedActor',
-        )
-      } else if (blocks.blockedBy) {
-        throw new InvalidRequestError(
-          `Requester is blocked by actor: $${actor}`,
-          'BlockedByActor',
-        )
-      }
-
-      const accountService = ctx.services.account(ctx.db)
-      const feedService = ctx.services.appView.feed(ctx.db)
-      const graphService = ctx.services.appView.graph(ctx.db)
-
-      const userLookupCol = actor.startsWith('did:')
-        ? 'did_handle.did'
-        : 'did_handle.handle'
-      const actorDidQb = db
-        .selectFrom('did_handle')
-        .select('did')
-        .where(userLookupCol, '=', actor)
-        .limit(1)
-
-      let feedItemsQb = feedService
-        .selectFeedItemQb()
-        .where('originatorDid', '=', actorDidQb)
-        .where((qb) =>
-          // Hide reposts of muted content
-          qb
-            .where('type', '=', 'post')
-            .orWhere((qb) =>
-              accountService.whereNotMuted(qb, requester, [
-                ref('post.creator'),
-              ]),
-            ),
-        )
-        .whereNotExists(graphService.blockQb(requester, [ref('post.creator')]))
-
-      const keyset = new FeedKeyset(
-        ref('feed_item.sortAt'),
-        ref('feed_item.cid'),
+      const requester =
+        auth.credentials.type === 'access' ? auth.credentials.did : null
+      const res = await ctx.appviewAgent.api.app.bsky.feed.getAuthorFeed(
+        params,
+        requester ? await ctx.serviceAuthHeaders(requester) : authPassthru(req),
       )
-
-      feedItemsQb = paginate(feedItemsQb, {
-        limit,
-        cursor,
-        keyset,
-      })
-
-      const feedItems: FeedRow[] = await feedItemsQb.execute()
-      const feed = await feedService.hydrateFeed(feedItems, requester)
-
+      if (requester) {
+        return await handleReadAfterWrite(ctx, requester, res, getAuthorMunge)
+      }
       return {
         encoding: 'application/json',
-        body: {
-          feed,
-          cursor: keyset.packFromResult(feedItems),
-        },
+        body: res.data,
       }
     },
   })
+}
+
+const getAuthorMunge = async (
+  ctx: AppContext,
+  original: OutputSchema,
+  local: LocalRecords,
+  requester: string,
+): Promise<OutputSchema> => {
+  const localSrvc = ctx.services.local(ctx.db)
+  const localProf = local.profile
+  // only munge on own feed
+  if (!isUsersFeed(original, requester)) {
+    return original
+  }
+  let feed = original.feed
+  // first update any out of date profile pictures in feed
+  if (localProf) {
+    feed = feed.map((item) => {
+      if (item.post.author.did === requester) {
+        return {
+          ...item,
+          post: {
+            ...item.post,
+            author: localSrvc.updateProfileViewBasic(
+              item.post.author,
+              localProf.record,
+            ),
+          },
+        }
+      } else {
+        return item
+      }
+    })
+  }
+  feed = await localSrvc.formatAndInsertPostsInFeed(feed, local.posts)
+  return {
+    ...original,
+    feed,
+  }
+}
+
+const isUsersFeed = (feed: OutputSchema, requester: string) => {
+  const first = feed.feed.at(0)
+  if (!first) return false
+  if (!first.reason && first.post.author.did === requester) return true
+  if (isReasonRepost(first.reason) && first.reason.by.did === requester)
+    return true
+  return false
 }

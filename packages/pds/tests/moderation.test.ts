@@ -1,5 +1,6 @@
 import AtpAgent, { ComAtprotoAdminTakeModerationAction } from '@atproto/api'
-import { AtUri } from '@atproto/uri'
+import { AtUri } from '@atproto/syntax'
+import { BlobNotFoundError } from '@atproto/repo'
 import {
   adminAuth,
   CloseFn,
@@ -7,6 +8,7 @@ import {
   moderatorAuth,
   runTestServer,
   TestServerInfo,
+  triageAuth,
 } from './_util'
 import { ImageRef, RecordRef, SeedClient } from './seeds/client'
 import basicSeed from './seeds/basic'
@@ -14,12 +16,13 @@ import {
   ACKNOWLEDGE,
   FLAG,
   TAKEDOWN,
+  ESCALATE,
 } from '../src/lexicon/types/com/atproto/admin/defs'
 import {
   REASONOTHER,
   REASONSPAM,
 } from '../src/lexicon/types/com/atproto/moderation/defs'
-import { BlobNotFoundError } from '@atproto/repo'
+import { PeriodicModerationActionReversal } from '../src'
 
 describe('moderation', () => {
   let server: TestServerInfo
@@ -292,7 +295,7 @@ describe('moderation', () => {
         password: 'password',
         token: deletionToken,
       })
-      await server.ctx.backgroundQueue.processAll()
+      await server.processAll()
       // Take action on deleted content
       const { data: action } =
         await agent.api.com.atproto.admin.takeModerationAction(
@@ -493,13 +496,13 @@ describe('moderation', () => {
       )
     })
 
-    it('supports flagging and acknowledging.', async () => {
+    it('supports escalating and acknowledging for triage.', async () => {
       const postRef1 = sc.posts[sc.dids.alice][0].ref
       const postRef2 = sc.posts[sc.dids.bob][0].ref
       const { data: action1 } =
         await agent.api.com.atproto.admin.takeModerationAction(
           {
-            action: FLAG,
+            action: ESCALATE,
             subject: {
               $type: 'com.atproto.repo.strongRef',
               uri: postRef1.uri.toString(),
@@ -510,12 +513,12 @@ describe('moderation', () => {
           },
           {
             encoding: 'application/json',
-            headers: { authorization: moderatorAuth() }, // As moderator
+            headers: { authorization: triageAuth() },
           },
         )
       expect(action1).toEqual(
         expect.objectContaining({
-          action: FLAG,
+          action: ESCALATE,
           subject: {
             $type: 'com.atproto.repo.strongRef',
             uri: postRef1.uriStr,
@@ -537,7 +540,7 @@ describe('moderation', () => {
           },
           {
             encoding: 'application/json',
-            headers: { authorization: adminAuth() },
+            headers: { authorization: triageAuth() },
           },
         )
       expect(action2).toEqual(
@@ -559,7 +562,7 @@ describe('moderation', () => {
         },
         {
           encoding: 'application/json',
-          headers: { authorization: adminAuth() },
+          headers: { authorization: triageAuth() },
         },
       )
       await agent.api.com.atproto.admin.reverseModerationAction(
@@ -570,7 +573,7 @@ describe('moderation', () => {
         },
         {
           encoding: 'application/json',
-          headers: { authorization: adminAuth() },
+          headers: { authorization: triageAuth() },
         },
       )
     })
@@ -959,7 +962,7 @@ describe('moderation', () => {
       await expect(getRepoLabels(sc.dids.bob)).resolves.toEqual(['kittens'])
     })
 
-    it('does not allow non-admin moderators to label.', async () => {
+    it('does not allow triage moderators to label.', async () => {
       const attemptLabel = agent.api.com.atproto.admin.takeModerationAction(
         {
           action: ACKNOWLEDGE,
@@ -974,32 +977,100 @@ describe('moderation', () => {
         },
         {
           encoding: 'application/json',
-          headers: { authorization: moderatorAuth() },
+          headers: { authorization: triageAuth() },
         },
       )
       await expect(attemptLabel).rejects.toThrow(
-        'Must be an admin to takedown or label content',
+        'Must be a full moderator to label content',
       )
     })
 
-    it('does not allow non-admin moderators to takedown.', async () => {
-      const attemptTakedown = agent.api.com.atproto.admin.takeModerationAction(
-        {
-          action: TAKEDOWN,
-          createdBy: 'did:example:moderator',
-          reason: 'Y',
-          subject: {
-            $type: 'com.atproto.admin.defs#repoRef',
-            did: sc.dids.bob,
+    it('allows full moderators to takedown.', async () => {
+      const { data: action } =
+        await agent.api.com.atproto.admin.takeModerationAction(
+          {
+            action: TAKEDOWN,
+            createdBy: 'did:example:moderator',
+            reason: 'Y',
+            subject: {
+              $type: 'com.atproto.admin.defs#repoRef',
+              did: sc.dids.bob,
+            },
           },
-        },
-        {
-          encoding: 'application/json',
-          headers: { authorization: moderatorAuth() },
-        },
-      )
-      await expect(attemptTakedown).rejects.toThrow(
-        'Must be an admin to takedown or label content',
+          {
+            encoding: 'application/json',
+            headers: { authorization: moderatorAuth() },
+          },
+        )
+      // cleanup
+      await reverse(action.id)
+    })
+
+    it('automatically reverses actions marked with duration', async () => {
+      const { data: action } =
+        await agent.api.com.atproto.admin.takeModerationAction(
+          {
+            action: TAKEDOWN,
+            createdBy: 'did:example:moderator',
+            reason: 'Y',
+            subject: {
+              $type: 'com.atproto.admin.defs#repoRef',
+              did: sc.dids.bob,
+            },
+            createLabelVals: ['takendown'],
+            // Use negative value to set the expiry time in the past so that the action is automatically reversed
+            // right away without having to wait n number of hours for a successful assertion
+            durationInHours: -1,
+          },
+          {
+            encoding: 'application/json',
+            headers: { authorization: moderatorAuth() },
+          },
+        )
+
+      const labelsAfterTakedown = await getRepoLabels(sc.dids.bob)
+      expect(labelsAfterTakedown).toContain('takendown')
+      // In the actual app, this will be instantiated and run on server startup
+      const periodicReversal = new PeriodicModerationActionReversal(server.ctx)
+      await periodicReversal.findAndRevertDueActions()
+
+      const { data: reversedAction } =
+        await agent.api.com.atproto.admin.getModerationAction(
+          { id: action.id },
+          { headers: { authorization: adminAuth() } },
+        )
+
+      // Verify that the automatic reversal is attributed to the original moderator of the temporary action
+      // and that the reason is set to indicate that the action was automatically reversed.
+      expect(reversedAction.reversal).toMatchObject({
+        createdBy: action.createdBy,
+        reason: '[SCHEDULED_REVERSAL] Reverting action as originally scheduled',
+      })
+
+      // Verify that labels are also reversed when takedown action is reversed
+      const labelsAfterReversal = await getRepoLabels(sc.dids.bob)
+      expect(labelsAfterReversal).not.toContain('takendown')
+    })
+
+    it('does not allow non-full moderators to takedown.', async () => {
+      const attemptTakedownTriage =
+        agent.api.com.atproto.admin.takeModerationAction(
+          {
+            action: TAKEDOWN,
+            createdBy: 'did:example:moderator',
+            reason: 'Y',
+            subject: {
+              $type: 'com.atproto.admin.defs#repoRef',
+              did: sc.dids.bob,
+            },
+          },
+          {
+            encoding: 'application/json',
+            headers: { authorization: triageAuth() },
+          },
+        )
+      await expect(attemptTakedownTriage).rejects.toThrow(
+        'Must be a full moderator to perform an account takedown',
       )
     })
 
@@ -1059,18 +1130,11 @@ describe('moderation', () => {
   describe('blob takedown', () => {
     let post: { ref: RecordRef; images: ImageRef[] }
     let blob: ImageRef
-    let imageUri: string
     let actionId: number
+
     beforeAll(async () => {
       post = sc.posts[sc.dids.carol][0]
       blob = post.images[1]
-      imageUri = server.ctx.imgUriBuilder
-        .getCommonSignedUri('feed_thumbnail', blob.image.ref.toString())
-        .replace(server.ctx.cfg.publicUrl, server.url)
-      // Warm image server cache
-      await fetch(imageUri)
-      const cached = await fetch(imageUri)
-      expect(cached.headers.get('x-cache')).toEqual('hit')
       const takeAction = await agent.api.com.atproto.admin.takeModerationAction(
         {
           action: TAKEDOWN,
@@ -1107,12 +1171,6 @@ describe('moderation', () => {
       await expect(referenceBlob).rejects.toThrow('Could not find blob:')
     })
 
-    it('prevents image blob from being served, even when cached.', async () => {
-      const fetchImage = await fetch(imageUri)
-      expect(fetchImage.status).toEqual(404)
-      expect(await fetchImage.json()).toEqual({ message: 'Image not found' })
-    })
-
     it('restores blob when action is reversed.', async () => {
       await agent.api.com.atproto.admin.reverseModerationAction(
         {
@@ -1129,12 +1187,6 @@ describe('moderation', () => {
       // Can post and reference blob
       const post = await sc.post(sc.dids.alice, 'pic', [], [blob])
       expect(post.images[0].image.ref.equals(blob.image.ref)).toBeTruthy()
-
-      // Can fetch through image server
-      const fetchImage = await fetch(imageUri)
-      expect(fetchImage.status).toEqual(200)
-      const size = Number(fetchImage.headers.get('content-length'))
-      expect(size).toBeGreaterThan(9000)
     })
   })
 })

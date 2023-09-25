@@ -1,7 +1,7 @@
 import getPort from 'get-port'
 import * as ui8 from 'uint8arrays'
 import * as pds from '@atproto/pds'
-import { Secp256k1Keypair } from '@atproto/crypto'
+import { Secp256k1Keypair, randomStr } from '@atproto/crypto'
 import { MessageDispatcher } from '@atproto/pds/src/event-stream/message-queue'
 import { AtpAgent } from '@atproto/api'
 import { Client as PlcClient } from '@did-plc/lib'
@@ -42,6 +42,8 @@ export class TestPds {
       serverDid,
       recoveryKey: recoveryKey.did(),
       adminPassword: 'admin-pass',
+      moderatorPassword: 'moderator-pass',
+      triagePassword: 'triage-pass',
       inviteRequired: false,
       userInviteInterval: null,
       userInviteEpoch: 0,
@@ -50,12 +52,10 @@ export class TestPds {
       didCacheStaleTTL: HOUR,
       jwtSecret: 'jwt-secret',
       availableUserDomains: ['.test'],
+      rateLimitsEnabled: false,
       appUrlPasswordReset: 'app://forgot-password',
       emailNoReplyAddress: 'noreply@blueskyweb.xyz',
       publicUrl: 'https://pds.public.url',
-      imgUriSalt: '9dd04221f5755bce5f55f47464c27e1e',
-      imgUriKey:
-        'f23ecd142835025f42c3db2cf25dd813956c178392760256211f9d315f8ab4d8',
       dbPostgresUrl: cfg.dbPostgresUrl,
       maxSubscriptionBuffer: 200,
       repoBackfillLimitMs: 1000 * 60 * 60, // 1hr
@@ -63,6 +63,10 @@ export class TestPds {
       labelerDid: 'did:example:labeler',
       labelerKeywords: { label_me: 'test-label', label_me_2: 'test-label-2' },
       feedGenDid: 'did:example:feedGen',
+      dbTxLockNonce: await randomStr(32, 'base32'),
+      bskyAppViewEndpoint: cfg.bskyAppViewEndpoint ?? 'http://fake_address',
+      bskyAppViewDid: cfg.bskyAppViewDid ?? 'did:example:fake',
+      bskyAppViewCdnUrlPattern: 'http://cdn.appview.com/%s/%s/%s',
       ...cfg,
     })
 
@@ -71,11 +75,12 @@ export class TestPds {
       ? pds.Database.postgres({
           url: config.dbPostgresUrl,
           schema: config.dbPostgresSchema,
+          txLockNonce: config.dbTxLockNonce,
         })
       : pds.Database.memory()
     await db.migrateToLatestOrThrow()
 
-    if (config.bskyAppViewEndpoint) {
+    if (cfg.bskyAppViewEndpoint && !cfg.enableInProcessAppView) {
       // Disable communication to app view within pds
       MessageDispatcher.prototype.send = async () => {}
     }
@@ -89,6 +94,9 @@ export class TestPds {
     })
 
     await server.start()
+
+    // we refresh label cache by hand in `processAll` instead of on a timer
+    if (!cfg.enableLabelsCache) server.ctx.labelCache.stop()
     return new TestPds(url, port, server)
   }
 
@@ -100,20 +108,28 @@ export class TestPds {
     return new AtpAgent({ service: `http://localhost:${this.port}` })
   }
 
-  adminAuth(): string {
+  adminAuth(role: 'admin' | 'moderator' | 'triage' = 'admin'): string {
+    const password =
+      role === 'triage'
+        ? this.ctx.cfg.triagePassword
+        : role === 'moderator'
+        ? this.ctx.cfg.moderatorPassword
+        : this.ctx.cfg.adminPassword
     return (
       'Basic ' +
-      ui8.toString(
-        ui8.fromString(`admin:${this.ctx.cfg.adminPassword}`, 'utf8'),
-        'base64pad',
-      )
+      ui8.toString(ui8.fromString(`admin:${password}`, 'utf8'), 'base64pad')
     )
   }
 
-  adminAuthHeaders() {
+  adminAuthHeaders(role?: 'admin' | 'moderator' | 'triage') {
     return {
-      authorization: this.adminAuth(),
+      authorization: this.adminAuth(role),
     }
+  }
+
+  async processAll() {
+    await this.ctx.backgroundQueue.processAll()
+    await this.ctx.labelCache.fullRefresh()
   }
 
   async close() {

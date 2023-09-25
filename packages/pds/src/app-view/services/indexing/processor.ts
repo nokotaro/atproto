@@ -1,5 +1,5 @@
 import { CID } from 'multiformats/cid'
-import { AtUri } from '@atproto/uri'
+import { AtUri } from '@atproto/syntax'
 import { cborToLexRecord } from '@atproto/repo'
 import Database from '../../../db'
 import DatabaseSchema from '../../../db/database-schema'
@@ -240,3 +240,20 @@ export class RecordProcessor<T, S> {
 }
 
 export default RecordProcessor
+
+export class NoopProcessor extends RecordProcessor<unknown, unknown> {
+  constructor(
+    lexId: string,
+    appDb: Database,
+    backgroundQueue: BackgroundQueue,
+  ) {
+    super(appDb, backgroundQueue, {
+      lexId,
+      insertFn: async () => null,
+      deleteFn: async () => null,
+      findDuplicate: async () => null,
+      notifsForInsert: () => [],
+      notifsForDelete: () => ({ notifs: [], toDelete: [] }),
+    })
+  }
+}

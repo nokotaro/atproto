@@ -1,29 +1,36 @@
 import AppContext from '../../../../context'
 import { Server } from '../../../../lexicon'
-import { cleanTerm, getUserSearchQuery } from '../../../../services/util/search'
+import {
+  cleanTerm,
+  getUserSearchQuerySimple,
+} from '../../../../services/util/search'
 
 export default function (server: Server, ctx: AppContext) {
   server.app.bsky.actor.searchActorsTypeahead({
     auth: ctx.authOptionalVerifier,
     handler: async ({ params, auth }) => {
-      const { services, db } = ctx
       const { limit, term: rawTerm } = params
       const requester = auth.credentials.did
       const term = cleanTerm(rawTerm || '')
 
+      const db = ctx.db.getReplica('search')
+
       const results = term
-        ? await getUserSearchQuery(db, { term, limit })
+        ? await getUserSearchQuerySimple(db, { term, limit })
             .selectAll('actor')
             .execute()
         : []
 
-      const actors = await services
+      const actors = await ctx.services
         .actor(db)
-        .views.profileBasic(results, requester)
+        .views.profilesBasic(results, requester, { omitLabels: true })
 
-      const filtered = actors.filter(
-        (actor) => !actor.viewer?.blocking && !actor.viewer?.blockedBy,
-      )
+      const SKIP = []
+      const filtered = results.flatMap((res) => {
+        const actor = actors[res.did]
+        if (actor.viewer?.blocking || actor.viewer?.blockedBy) return SKIP
+        return actor
+      })
 
       return {
         encoding: 'application/json',

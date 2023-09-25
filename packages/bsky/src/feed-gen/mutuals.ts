@@ -7,21 +7,22 @@ import { FeedKeyset, getFeedDateThreshold } from '../api/app/bsky/util/feed'
 const handler: AlgoHandler = async (
   ctx: AppContext,
   params: SkeletonParams,
-  requester: string,
+  viewer: string,
 ): Promise<AlgoResponse> => {
   const { limit = 50, cursor } = params
-  const feedService = ctx.services.feed(ctx.db)
+  const db = ctx.db.getReplica('feed')
+  const feedService = ctx.services.feed(db)
 
-  const { ref } = ctx.db.db.dynamic
+  const { ref } = db.db.dynamic
 
-  const mutualsSubquery = ctx.db.db
+  const mutualsSubquery = db.db
     .selectFrom('follow')
-    .where('follow.creator', '=', requester)
+    .where('follow.creator', '=', viewer)
     .whereExists((qb) =>
       qb
         .selectFrom('follow as follow_inner')
         .whereRef('follow_inner.creator', '=', 'follow.subjectDid')
-        .where('follow_inner.subjectDid', '=', requester)
+        .where('follow_inner.subjectDid', '=', viewer)
         .selectAll(),
     )
     .select('follow.subjectDid')
@@ -29,13 +30,12 @@ const handler: AlgoHandler = async (
   const keyset = new FeedKeyset(ref('feed_item.sortAt'), ref('feed_item.cid'))
   const sortFrom = keyset.unpack(cursor)?.primary
 
-  // @TODO apply blocks and mutes
   let feedQb = feedService
     .selectFeedItemQb()
     .where('feed_item.type', '=', 'post') // ensures originatorDid is post.creator
     .where((qb) =>
       qb
-        .where('originatorDid', '=', requester)
+        .where('originatorDid', '=', viewer)
         .orWhere('originatorDid', 'in', mutualsSubquery),
     )
     .where('feed_item.sortAt', '>', getFeedDateThreshold(sortFrom))
@@ -43,6 +43,7 @@ const handler: AlgoHandler = async (
   feedQb = paginate(feedQb, { limit, cursor, keyset })
 
   const feedItems = await feedQb.execute()
+
   return {
     feedItems,
     cursor: keyset.packFromResult(feedItems),

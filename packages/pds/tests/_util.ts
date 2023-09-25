@@ -4,8 +4,9 @@ import path from 'path'
 import * as crypto from '@atproto/crypto'
 import * as plc from '@did-plc/lib'
 import { PlcServer, Database as PlcDatabase } from '@did-plc/server'
-import { AtUri } from '@atproto/uri'
+import { AtUri } from '@atproto/syntax'
 import { randomStr } from '@atproto/crypto'
+import { uniqueLockId } from '@atproto/dev-env'
 import { CID } from 'multiformats/cid'
 import * as uint8arrays from 'uint8arrays'
 import { PDS, ServerConfig, Database, MemoryBlobStore } from '../src/index'
@@ -14,21 +15,21 @@ import DiskBlobStore from '../src/storage/disk-blobstore'
 import AppContext from '../src/context'
 import { DAY, HOUR } from '@atproto/common'
 import { lexToJson } from '@atproto/lexicon'
-import { MountedAlgos } from '../src/feed-gen/types'
 
 const ADMIN_PASSWORD = 'admin-pass'
 const MODERATOR_PASSWORD = 'moderator-pass'
+const TRIAGE_PASSWORD = 'triage-pass'
 
 export type CloseFn = () => Promise<void>
 export type TestServerInfo = {
   url: string
   ctx: AppContext
   close: CloseFn
+  processAll: () => Promise<void>
 }
 
 export type TestServerOpts = {
   migration?: string
-  algos?: MountedAlgos
 }
 
 export const runTestServer = async (
@@ -81,6 +82,7 @@ export const runTestServer = async (
     recoveryKey,
     adminPassword: ADMIN_PASSWORD,
     moderatorPassword: MODERATOR_PASSWORD,
+    triagePassword: TRIAGE_PASSWORD,
     inviteRequired: false,
     userInviteInterval: null,
     userInviteEpoch: Date.now(),
@@ -89,12 +91,10 @@ export const runTestServer = async (
     didCacheStaleTTL: HOUR,
     jwtSecret: 'jwt-secret',
     availableUserDomains: ['.test'],
+    rateLimitsEnabled: false,
     appUrlPasswordReset: 'app://forgot-password',
     emailNoReplyAddress: 'noreply@blueskyweb.xyz',
     publicUrl: 'https://pds.public.url',
-    imgUriSalt: '9dd04221f5755bce5f55f47464c27e1e',
-    imgUriKey:
-      'f23ecd142835025f42c3db2cf25dd813956c178392760256211f9d315f8ab4d8',
     dbPostgresUrl: process.env.DB_POSTGRES_URL,
     blobstoreLocation: `${blobstoreLoc}/blobs`,
     blobstoreTmp: `${blobstoreLoc}/tmp`,
@@ -104,6 +104,9 @@ export const runTestServer = async (
     maxSubscriptionBuffer: 200,
     repoBackfillLimitMs: HOUR,
     sequencerLeaderLockId: uniqueLockId(),
+    bskyAppViewEndpoint: 'http://fake_address.invalid',
+    bskyAppViewDid: 'did:example:fake',
+    dbTxLockNonce: await randomStr(32, 'base32'),
     ...params,
   })
 
@@ -112,6 +115,7 @@ export const runTestServer = async (
       ? Database.postgres({
           url: cfg.dbPostgresUrl,
           schema: cfg.dbPostgresSchema,
+          txLockNonce: cfg.dbTxLockNonce,
         })
       : Database.memory()
 
@@ -122,6 +126,7 @@ export const runTestServer = async (
       ? Database.postgres({
           url: cfg.dbPostgresUrl,
           schema: cfg.dbPostgresSchema,
+          txLockNonce: cfg.dbTxLockNonce,
         })
       : db
   if (opts.migration) {
@@ -144,10 +149,12 @@ export const runTestServer = async (
     repoSigningKey,
     plcRotationKey,
     config: cfg,
-    algos: opts.algos,
   })
   const pdsServer = await pds.start()
   const pdsPort = (pdsServer.address() as AddressInfo).port
+
+  // we refresh label cache by hand in `processAll` instead of on a timer
+  pds.ctx.labelCache.stop()
 
   return {
     url: `http://localhost:${pdsPort}`,
@@ -156,17 +163,11 @@ export const runTestServer = async (
       await pds.destroy()
       await plcServer.destroy()
     },
+    processAll: async () => {
+      await pds.ctx.backgroundQueue.processAll()
+      await pds.ctx.labelCache.fullRefresh()
+    },
   }
-}
-
-const usedLockIds = new Set()
-const uniqueLockId = () => {
-  let lockId: number
-  do {
-    lockId = 1000 + Math.ceil(1000 * Math.random())
-  } while (usedLockIds.has(lockId))
-  usedLockIds.add(lockId)
-  return lockId
 }
 
 export const adminAuth = () => {
@@ -175,6 +176,10 @@ export const adminAuth = () => {
 
 export const moderatorAuth = () => {
   return basicAuth('admin', MODERATOR_PASSWORD)
+}
+
+export const triageAuth = () => {
+  return basicAuth('admin', TRIAGE_PASSWORD)
 }
 
 const basicAuth = (username: string, password: string) => {
@@ -230,8 +235,12 @@ export const forSnapshot = (obj: unknown) => {
     if (str.match(/^\d+::bafy/)) {
       return constantKeysetCursor
     }
+
+    if (str.match(/^\d+::did:plc/)) {
+      return constantDidCursor
+    }
     if (str.match(/\/image\/[^/]+\/.+\/did:plc:[^/]+\/[^/]+@[\w]+$/)) {
-      // Match image urls
+      // Match image urls (pds)
       const match = str.match(
         /\/image\/([^/]+)\/.+\/(did:plc:[^/]+)\/([^/]+)@[\w]+$/,
       )
@@ -241,6 +250,15 @@ export const forSnapshot = (obj: unknown) => {
         .replace(sig, 'sig()')
         .replace(did, take(users, did))
         .replace(cid, take(cids, cid))
+    }
+    if (str.match(/\/img\/[^/]+\/.+\/did:plc:[^/]+\/[^/]+@[\w]+$/)) {
+      // Match image urls (bsky w/ presets)
+      const match = str.match(
+        /\/img\/[^/]+\/.+\/(did:plc:[^/]+)\/([^/]+)@[\w]+$/,
+      )
+      if (!match) return str
+      const [, did, cid] = match
+      return str.replace(did, take(users, did)).replace(cid, take(cids, cid))
     }
     if (str.startsWith('pds-public-url-')) {
       return 'invite-code'
@@ -298,6 +316,7 @@ export function take(
 
 export const constantDate = new Date(0).toISOString()
 export const constantKeysetCursor = '0000000000000::bafycid'
+export const constantDidCursor = '0000000000000::did'
 
 const mapLeafValues = (obj: unknown, fn: (val: unknown) => unknown) => {
   if (Array.isArray(obj)) {

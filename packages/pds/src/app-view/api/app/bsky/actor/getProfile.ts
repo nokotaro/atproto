@@ -1,44 +1,38 @@
-import { InvalidRequestError } from '@atproto/xrpc-server'
 import { Server } from '../../../../../lexicon'
-import { softDeleted } from '../../../../../db/util'
 import AppContext from '../../../../../context'
+import { authPassthru } from '../../../../../api/com/atproto/admin/util'
+import { OutputSchema } from '../../../../../lexicon/types/app/bsky/actor/getProfile'
+import { handleReadAfterWrite } from '../util/read-after-write'
+import { LocalRecords } from '../../../../../services/local'
 
 export default function (server: Server, ctx: AppContext) {
   server.app.bsky.actor.getProfile({
-    auth: ctx.accessVerifier,
+    auth: ctx.accessOrRoleVerifier,
     handler: async ({ req, auth, params }) => {
-      const requester = auth.credentials.did
-      if (ctx.canProxy(req)) {
-        const res = await ctx.appviewAgent.api.app.bsky.actor.getProfile(
-          params,
-          await ctx.serviceAuthHeaders(requester),
-        )
-        return {
-          encoding: 'application/json',
-          body: res.data,
-        }
+      const requester =
+        auth.credentials.type === 'access' ? auth.credentials.did : null
+      const res = await ctx.appviewAgent.api.app.bsky.actor.getProfile(
+        params,
+        requester ? await ctx.serviceAuthHeaders(requester) : authPassthru(req),
+      )
+      if (res.data.did === requester) {
+        return await handleReadAfterWrite(ctx, requester, res, getProfileMunge)
       }
-
-      const { actor } = params
-      const { db, services } = ctx
-      const actorService = services.appView.actor(db)
-
-      const actorRes = await actorService.getActor(actor, true)
-
-      if (!actorRes) {
-        throw new InvalidRequestError('Profile not found')
-      }
-      if (softDeleted(actorRes)) {
-        throw new InvalidRequestError(
-          'Account has been taken down',
-          'AccountTakedown',
-        )
-      }
-
       return {
         encoding: 'application/json',
-        body: await actorService.views.profileDetailed(actorRes, requester),
+        body: res.data,
       }
     },
   })
+}
+
+const getProfileMunge = async (
+  ctx: AppContext,
+  original: OutputSchema,
+  local: LocalRecords,
+): Promise<OutputSchema> => {
+  if (!local.profile) return original
+  return ctx.services
+    .local(ctx.db)
+    .updateProfileDetailed(original, local.profile.record)
 }

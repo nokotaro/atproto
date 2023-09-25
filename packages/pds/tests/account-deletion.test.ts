@@ -22,8 +22,6 @@ import {
   PostEmbedExternal,
   PostEmbedRecord,
 } from '../src/app-view/db/tables/post-embed'
-import { RepoCommitHistory } from '../src/db/tables/repo-commit-history'
-import { RepoCommitBlock } from '../src/db/tables/repo-commit-block'
 import { Record } from '../src/db/tables/record'
 import { RepoSeq } from '../src/db/tables/repo-seq'
 import { ACKNOWLEDGE } from '../src/lexicon/types/com/atproto/admin/defs'
@@ -146,7 +144,7 @@ describe('account deletion', () => {
       did: carol.did,
       password: carol.password,
     })
-    await server.ctx.backgroundQueue.processAll() // Finish background hard-deletions
+    await server.processAll() // Finish background hard-deletions
   })
 
   it('no longer lets the user log in', async () => {
@@ -171,17 +169,16 @@ describe('account deletion', () => {
     expect(updatedDbContents.blocks).toEqual(
       initialDbContents.blocks.filter((row) => row.creator !== carol.did),
     )
-    expect(updatedDbContents.seqs).toEqual(
-      initialDbContents.seqs.filter((row) => row.did !== carol.did),
-    )
-    expect(updatedDbContents.commitBlocks).toEqual(
-      initialDbContents.commitBlocks.filter((row) => row.creator !== carol.did),
-    )
-    expect(updatedDbContents.commitHistories).toEqual(
-      initialDbContents.commitHistories.filter(
-        (row) => row.creator !== carol.did,
-      ),
-    )
+    // check all seqs for this did are gone, except for the tombstone
+    expect(
+      updatedDbContents.seqs.filter((row) => row.eventType !== 'tombstone'),
+    ).toEqual(initialDbContents.seqs.filter((row) => row.did !== carol.did))
+    // check we do have a tombstone for this did
+    expect(
+      updatedDbContents.seqs.filter(
+        (row) => row.did === carol.did && row.eventType === 'tombstone',
+      ).length,
+    ).toEqual(1)
   })
 
   it('no longer stores indexed records from the user', async () => {
@@ -240,29 +237,6 @@ describe('account deletion', () => {
     )
   })
 
-  it('no longer displays the users posts in feeds', async () => {
-    const feed = await agent.api.app.bsky.feed.getTimeline(undefined, {
-      headers: sc.getHeaders(sc.dids.alice),
-    })
-    const found = feed.data.feed.filter(
-      (item) => item.post.author.did === carol.did,
-    )
-    expect(found.length).toBe(0)
-  })
-
-  it('removes notifications from the user', async () => {
-    const notifs = await agent.api.app.bsky.notification.listNotifications(
-      undefined,
-      {
-        headers: sc.getHeaders(sc.dids.alice),
-      },
-    )
-    const found = notifs.data.notifications.filter(
-      (item) => item.author.did === sc.dids.carol,
-    )
-    expect(found.length).toBe(0)
-  })
-
   it('can delete an empty user', async () => {
     const eve = await sc.createAccount('eve', {
       handle: 'eve.test',
@@ -294,8 +268,6 @@ type DbContents = {
   userState: UserState[]
   blocks: IpldBlock[]
   seqs: Selectable<RepoSeq>[]
-  commitHistories: RepoCommitHistory[]
-  commitBlocks: RepoCommitBlock[]
   records: Record[]
   posts: Post[]
   postImages: PostEmbedImage[]
@@ -318,8 +290,6 @@ const getDbContents = async (db: Database): Promise<DbContents> => {
     userState,
     blocks,
     seqs,
-    commitHistories,
-    commitBlocks,
     records,
     posts,
     postImages,
@@ -344,19 +314,6 @@ const getDbContents = async (db: Database): Promise<DbContents> => {
       .selectAll()
       .execute(),
     db.db.selectFrom('repo_seq').orderBy('id').selectAll().execute(),
-    db.db
-      .selectFrom('repo_commit_history')
-      .orderBy('creator')
-      .orderBy('commit')
-      .selectAll()
-      .execute(),
-    db.db
-      .selectFrom('repo_commit_block')
-      .orderBy('creator')
-      .orderBy('commit')
-      .orderBy('block')
-      .selectAll()
-      .execute(),
     db.db.selectFrom('record').orderBy('uri').selectAll().execute(),
     db.db.selectFrom('post').orderBy('uri').selectAll().execute(),
     db.db
@@ -395,8 +352,6 @@ const getDbContents = async (db: Database): Promise<DbContents> => {
     userState,
     blocks,
     seqs,
-    commitHistories,
-    commitBlocks,
     records,
     posts,
     postImages,
