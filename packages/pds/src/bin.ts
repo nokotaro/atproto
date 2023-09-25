@@ -26,7 +26,7 @@ const run = async () => {
     db = Database.memory()
   }
 
-  // await db.migrateToLatestOrThrow()
+  await db.migrateToLatestOrThrow()
 
   let blobstore: BlobStore
   if (cfg.blobstoreLocation) {
