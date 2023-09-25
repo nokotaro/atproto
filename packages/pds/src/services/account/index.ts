@@ -1,23 +1,16 @@
-import { WhereInterface, sql } from 'kysely'
+import { sql } from 'kysely'
+import { randomStr } from '@atproto/crypto'
+import { InvalidRequestError } from '@atproto/xrpc-server'
 import { dbLogger as log } from '../../logger'
 import Database from '../../db'
 import * as scrypt from '../../db/scrypt'
 import { UserAccountEntry } from '../../db/tables/user-account'
 import { DidHandle } from '../../db/tables/did-handle'
 import { RepoRoot } from '../../db/tables/repo-root'
-import {
-  DbRef,
-  countAll,
-  notSoftDeletedClause,
-  nullToZero,
-} from '../../db/util'
-import { getUserSearchQueryPg, getUserSearchQuerySqlite } from '../util/search'
+import { countAll, notSoftDeletedClause } from '../../db/util'
 import { paginate, TimeCidKeyset } from '../../db/pagination'
 import * as sequencer from '../../sequencer'
 import { AppPassword } from '../../lexicon/types/com/atproto/server/createAppPassword'
-import { randomStr } from '@atproto/crypto'
-import { InvalidRequestError } from '@atproto/xrpc-server'
-import { NotEmptyArray } from '@atproto/common'
 
 export class AccountService {
   constructor(public db: Database) {}
@@ -42,7 +35,13 @@ export class AccountService {
         if (handleOrDid.startsWith('did:')) {
           return qb.where('did_handle.did', '=', handleOrDid)
         } else {
-          return qb.where('did_handle.handle', '=', handleOrDid)
+          // lower() is a little hack to avoid using the handle trgm index here, which is slow. not sure why it was preferring
+          // the handle trgm index over the handle unique index. in any case, we end-up using did_handle_handle_lower_idx instead, which is fast.
+          return qb.where(
+            sql`lower(${ref('did_handle.handle')})`,
+            '=',
+            handleOrDid,
+          )
         }
       })
       .selectAll('user_account')
@@ -87,7 +86,13 @@ export class AccountService {
     handleOrDid: string,
     includeSoftDeleted = false,
   ): Promise<string | null> {
-    if (handleOrDid.startsWith('did:')) return handleOrDid
+    if (handleOrDid.startsWith('did:')) {
+      if (includeSoftDeleted) {
+        return handleOrDid
+      }
+      const available = await this.isRepoAvailable(handleOrDid)
+      return available ? handleOrDid : null
+    }
     const { ref } = this.db.db.dynamic
     const found = await this.db.db
       .selectFrom('did_handle')
@@ -127,33 +132,29 @@ export class AccountService {
       .onConflict((oc) => oc.doNothing())
       .returning('handle')
       .executeTakeFirst()
-    const registerUserState = this.db.db
-      .insertInto('user_state')
-      .values({
-        did,
-        lastSeenNotifs: new Date().toISOString(),
-      })
-      .onConflict((oc) => oc.doNothing())
-      .returning('did')
-      .executeTakeFirst()
 
-    const [res1, res2, res3] = await Promise.all([
+    const [res1, res2] = await Promise.all([
       registerUserAccnt,
       registerDidHandle,
-      registerUserState,
     ])
-    if (!res1 || !res2 || !res3) {
+    if (!res1 || !res2) {
       throw new UserAlreadyExistsError()
     }
     log.info({ handle, email, did }, 'registered user')
   }
 
-  async updateHandle(did: string, handle: string) {
+  // @NOTE should always be paired with a sequenceHandle().
+  // the token output from this method should be passed to sequenceHandle().
+  async updateHandle(
+    did: string,
+    handle: string,
+  ): Promise<HandleSequenceToken> {
     const res = await this.db.db
       .updateTable('did_handle')
       .set({ handle })
       .where('did', '=', did)
       .whereNotExists(
+        // @NOTE see also condition in isHandleAvailable()
         this.db.db
           .selectFrom('did_handle')
           .where('handle', '=', handle)
@@ -163,8 +164,23 @@ export class AccountService {
     if (res.numUpdatedRows < 1) {
       throw new UserAlreadyExistsError()
     }
-    const seqEvt = await sequencer.formatSeqHandleUpdate(did, handle)
+    return { did, handle }
+  }
+
+  async sequenceHandle(tok: HandleSequenceToken) {
+    this.db.assertTransaction()
+    const seqEvt = await sequencer.formatSeqHandleUpdate(tok.did, tok.handle)
     await sequencer.sequenceEvt(this.db, seqEvt)
+  }
+
+  async getHandleDid(handle: string): Promise<string | null> {
+    // @NOTE see also condition in updateHandle()
+    const found = await this.db.db
+      .selectFrom('did_handle')
+      .where('handle', '=', handle)
+      .selectAll()
+      .executeTakeFirst()
+    return found?.did ?? null
   }
 
   async updateEmail(did: string, email: string) {
@@ -257,130 +273,45 @@ export class AccountService {
       .execute()
   }
 
-  async mute(info: { did: string; mutedByDid: string; createdAt?: Date }) {
-    const { did, mutedByDid, createdAt = new Date() } = info
-    await this.db.db
-      .insertInto('mute')
-      .values({
-        did,
-        mutedByDid,
-        createdAt: createdAt.toISOString(),
-      })
-      .onConflict((oc) => oc.doNothing())
-      .execute()
-  }
-
-  async unmute(info: { did: string; mutedByDid: string }) {
-    const { did, mutedByDid } = info
-    await this.db.db
-      .deleteFrom('mute')
-      .where('did', '=', did)
-      .where('mutedByDid', '=', mutedByDid)
-      .execute()
-  }
-
-  async getMute(mutedBy: string, did: string): Promise<boolean> {
-    const mutes = await this.getMutes(mutedBy, [did])
-    return mutes[did] ?? false
-  }
-
-  async getMutes(
-    mutedBy: string,
-    dids: string[],
-  ): Promise<Record<string, boolean>> {
-    if (dids.length === 0) return {}
-    const res = await this.db.db
-      .selectFrom('mute')
-      .where('mutedByDid', '=', mutedBy)
-      .where('did', 'in', dids)
-      .selectAll()
-      .execute()
-    return res.reduce((acc, cur) => {
-      acc[cur.did] = true
-      return acc
-    }, {} as Record<string, boolean>)
-  }
-
-  async muteActorList(info: {
-    list: string
-    mutedByDid: string
-    createdAt?: Date
-  }) {
-    const { list, mutedByDid, createdAt = new Date() } = info
-    await this.db.db
-      .insertInto('list_mute')
-      .values({
-        listUri: list,
-        mutedByDid,
-        createdAt: createdAt.toISOString(),
-      })
-      .onConflict((oc) => oc.doNothing())
-      .execute()
-  }
-
-  async unmuteActorList(info: { list: string; mutedByDid: string }) {
-    const { list, mutedByDid } = info
-    await this.db.db
-      .deleteFrom('list_mute')
-      .where('listUri', '=', list)
-      .where('mutedByDid', '=', mutedByDid)
-      .execute()
-  }
-
-  whereNotMuted<W extends WhereInterface<any, any>>(
-    qb: W,
-    requester: string,
-    refs: NotEmptyArray<DbRef>,
-  ) {
-    const subjectRefs = sql.join(refs)
-    const actorMute = this.db.db
-      .selectFrom('mute')
-      .where('mutedByDid', '=', requester)
-      .where('did', 'in', sql`(${subjectRefs})`)
-      .select('did as muted')
-    const listMute = this.db.db
-      .selectFrom('list_item')
-      .innerJoin('list_mute', 'list_mute.listUri', 'list_item.listUri')
-      .where('list_mute.mutedByDid', '=', requester)
-      .whereRef('list_item.subjectDid', 'in', sql`(${subjectRefs})`)
-      .select('list_item.subjectDid as muted')
-    // Splitting the mute from list-mute checks seems to be more flexible for the query-planner and often quicker
-    return qb.whereNotExists(actorMute).whereNotExists(listMute)
-  }
-
   async search(opts: {
-    searchField?: 'did' | 'handle'
     term: string
     limit: number
     cursor?: string
     includeSoftDeleted?: boolean
-  }): Promise<(RepoRoot & DidHandle & { distance: number })[]> {
-    if (opts.searchField === 'did') {
-      const didSearchBuilder = this.db.db
-        .selectFrom('did_handle')
-        .where('did_handle.did', '=', opts.term)
-        .innerJoin('repo_root', 'repo_root.did', 'did_handle.did')
-        .selectAll(['did_handle', 'repo_root'])
-        .select(sql<number>`0`.as('distance'))
+  }): Promise<(RepoRoot & DidHandle)[]> {
+    const { term, limit, cursor, includeSoftDeleted } = opts
+    const { ref } = this.db.db.dynamic
 
-      return await didSearchBuilder.execute()
-    }
+    const builder = this.db.db
+      .selectFrom('did_handle')
+      .innerJoin('repo_root', 'repo_root.did', 'did_handle.did')
+      .innerJoin('user_account', 'user_account.did', 'did_handle.did')
+      .if(!includeSoftDeleted, (qb) =>
+        qb.where(notSoftDeletedClause(ref('repo_root'))),
+      )
+      .where((qb) => {
+        // sqlite doesn't support "ilike", but performs "like" case-insensitively
+        const likeOp = this.db.dialect === 'pg' ? 'ilike' : 'like'
+        if (term.includes('@')) {
+          return qb.where('user_account.email', likeOp, `%${term}%`)
+        }
+        if (term.startsWith('did:')) {
+          return qb.where('did_handle.did', '=', term)
+        }
+        return qb.where('did_handle.handle', likeOp, `${term}%`)
+      })
+      .selectAll(['did_handle', 'repo_root'])
 
-    const builder =
-      this.db.dialect === 'pg'
-        ? getUserSearchQueryPg(this.db, opts)
-            .innerJoin('repo_root', 'repo_root.did', 'did_handle.did')
-            .selectAll('did_handle')
-            .selectAll('repo_root')
-            .select('results.distance as distance')
-        : getUserSearchQuerySqlite(this.db, opts)
-            .leftJoin('profile', 'profile.creator', 'did_handle.did') // @TODO leaky, for getUserSearchQuerySqlite()
-            .innerJoin('repo_root', 'repo_root.did', 'did_handle.did')
-            .selectAll('did_handle')
-            .selectAll('repo_root')
-            .select(sql<number>`0`.as('distance'))
+    const keyset = new ListKeyset(
+      ref('repo_root.indexedAt'),
+      ref('did_handle.handle'),
+    )
 
-    return await builder.execute()
+    return await paginate(builder, {
+      limit,
+      cursor,
+      keyset,
+    }).execute()
   }
 
   async list(opts: {
@@ -433,26 +364,19 @@ export class AccountService {
       .where('user_account.did', '=', did)
       .execute()
     await this.db.db
-      .deleteFrom('user_state')
-      .where('user_state.did', '=', did)
-      .execute()
-    await this.db.db
       .deleteFrom('did_handle')
       .where('did_handle.did', '=', did)
       .execute()
+    const seqEvt = await sequencer.formatSeqTombstone(did)
+    await this.db.transaction(async (txn) => {
+      await sequencer.sequenceEvt(txn, seqEvt)
+    })
   }
 
   selectInviteCodesQb() {
     const ref = this.db.db.dynamic.ref
     const builder = this.db.db
-      .with('use_count', (qb) =>
-        qb
-          .selectFrom('invite_code_use')
-          .groupBy('code')
-          .select(['code', countAll.as('uses')]),
-      )
       .selectFrom('invite_code')
-      .leftJoin('use_count', 'invite_code.code', 'use_count.code')
       .select([
         'invite_code.code as code',
         'invite_code.availableUses as available',
@@ -460,7 +384,11 @@ export class AccountService {
         'invite_code.forUser as forAccount',
         'invite_code.createdBy as createdBy',
         'invite_code.createdAt as createdAt',
-        nullToZero(ref('use_count.uses')).as('uses'),
+        this.db.db
+          .selectFrom('invite_code_use')
+          .select(countAll.as('count'))
+          .whereRef('invite_code_use.code', '=', ref('invite_code.code'))
+          .as('uses'),
       ])
     return this.db.db.selectFrom(builder.as('codes')).selectAll()
   }
@@ -484,7 +412,7 @@ export class AccountService {
     return uses
   }
 
-  async getAccountInviteCodes(did: string) {
+  async getAccountInviteCodes(did: string): Promise<CodeDetail[]> {
     const res = await this.selectInviteCodesQb()
       .where('forAccount', '=', did)
       .execute()
@@ -526,15 +454,6 @@ export class AccountService {
     }, {} as Record<string, CodeDetail>)
   }
 
-  async getLastSeenNotifs(did: string): Promise<string | undefined> {
-    const res = await this.db.db
-      .selectFrom('user_state')
-      .where('did', '=', did)
-      .selectAll()
-      .executeTakeFirst()
-    return res?.lastSeenNotifs
-  }
-
   async getPreferences(
     did: string,
     namespace?: string,
@@ -560,6 +479,15 @@ export class AccountService {
       throw new InvalidRequestError(
         `Some preferences are not in the ${namespace} namespace`,
       )
+    }
+    // short-held row lock to prevent races
+    if (this.db.dialect === 'pg') {
+      await this.db.db
+        .selectFrom('user_account')
+        .selectAll()
+        .forUpdate()
+        .where('did', '=', did)
+        .executeTakeFirst()
     }
     // get all current prefs for user and prep new pref rows
     const allPrefs = await this.db.db
@@ -593,7 +521,7 @@ export class AccountService {
 
 export type UserPreference = Record<string, unknown> & { $type: string }
 
-type CodeDetail = {
+export type CodeDetail = {
   code: string
   available: number
   disabled: boolean
@@ -622,3 +550,5 @@ export class ListKeyset extends TimeCidKeyset<{
 const matchNamespace = (namespace: string, fullname: string) => {
   return fullname === namespace || fullname.startsWith(`${namespace}.`)
 }
+
+export type HandleSequenceToken = { did: string; handle: string }

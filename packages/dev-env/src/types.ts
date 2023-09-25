@@ -1,28 +1,35 @@
 import * as pds from '@atproto/pds'
 import * as bsky from '@atproto/bsky'
+import { ImageInvalidator } from '@atproto/bsky/src/image/invalidator'
 
 export type PlcConfig = {
   port?: number
   version?: string
 }
 
-export type PdsConfig = Partial<pds.ServerConfig> & {
-  plcUrl: string
+export type PdsConfig = Partial<pds.ServerEnvironment> & {
+  didPlcUrl: string
   migration?: string
+  enableLabelsCache?: boolean
 }
 
 export type BskyConfig = Partial<bsky.ServerConfig> & {
   plcUrl: string
   repoProvider: string
-  dbPostgresUrl: string
+  dbPrimaryPostgresUrl: string
+  redisHost: string
+  pdsPort: number
+  imgInvalidator?: ImageInvalidator
   migration?: string
   algos?: bsky.MountedAlgos
+  indexer?: Partial<bsky.IndexerConfig>
+  ingester?: Partial<bsky.IngesterConfig>
 }
 
 export type TestServerParams = {
   dbPostgresUrl: string
   dbPostgresSchema: string
-  pds: Partial<pds.ServerConfig>
-  plc: Partial<pds.ServerConfig>
+  pds: Partial<PdsConfig>
+  plc: Partial<PlcConfig>
   bsky: Partial<BskyConfig>
 }

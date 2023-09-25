@@ -2,6 +2,7 @@ import {
   DummyDriver,
   DynamicModule,
   RawBuilder,
+  SelectQueryBuilder,
   sql,
   SqliteAdapter,
   SqliteIntrospector,
@@ -22,7 +23,7 @@ export const notSoftDeletedClause = (alias: DbRef) => {
   return sql`${alias}."takedownId" is null`
 }
 
-export const softDeleted = (repoOrRecord: { takedownId: number | null }) => {
+export const softDeleted = (repoOrRecord: { takedownId: string | null }) => {
   return repoOrRecord.takedownId !== null
 }
 
@@ -31,10 +32,6 @@ export const countAll = sql<number>`count(*)`
 // For use with doUpdateSet()
 export const excluded = <T>(db: DatabaseSchema, col) => {
   return sql<T>`${db.dynamic.ref(`excluded.${col}`)}`
-}
-
-export const nullToZero = (ref: DbRef) => {
-  return sql<number>`coalesce(${ref}, 0)`
 }
 
 // Can be useful for large where-in clauses, to get the db to use a hash lookup on the list
@@ -58,3 +55,5 @@ export const dummyDialect = {
 }
 
 export type DbRef = RawBuilder | ReturnType<DynamicModule['ref']>
+
+export type AnyQb = SelectQueryBuilder<any, any, any>

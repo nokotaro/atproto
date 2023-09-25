@@ -2,4 +2,5 @@
 // It's important that every migration is exported from here with the proper name. We'd simplify
 // this with kysely's FileMigrationProvider, but it doesn't play nicely with the build process.
 
-export * as _20230530T213530067Z from './20230530T213530067Z-rebase-indices'
+export * as _20230613T164932261Z from './20230613T164932261Z-init'
+export * as _20230914T014727199Z from './20230914T014727199Z-repo-v3'

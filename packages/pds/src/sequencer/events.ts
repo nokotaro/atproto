@@ -6,7 +6,6 @@ import {
   blocksToCarFile,
   CidSet,
   CommitData,
-  RebaseData,
   WriteOpAction,
 } from '@atproto/repo'
 import { PreparedWrite } from '../repo'
@@ -14,6 +13,7 @@ import { CID } from 'multiformats/cid'
 import { EventType, RepoSeqInsert } from '../db/tables/repo-seq'
 
 export const sequenceEvt = async (dbTxn: Database, evt: RepoSeqInsert) => {
+  dbTxn.assertTransaction()
   await dbTxn.notify('new_repo_event')
   if (evt.eventType === 'rebase') {
     await invalidatePrevRepoOps(dbTxn, evt.did)
@@ -34,6 +34,7 @@ export const sequenceEvt = async (dbTxn: Database, evt: RepoSeqInsert) => {
       .set({ seq: res.id })
       .where('id', '=', res.id)
       .execute()
+    await dbTxn.notify('outgoing_repo_seq')
   }
 }
 
@@ -48,11 +49,11 @@ export const formatSeqCommit = async (
   let carSlice: Uint8Array
 
   // max 200 ops or 1MB of data
-  if (writes.length > 200 || commitData.blocks.byteSize > 1000000) {
+  if (writes.length > 200 || commitData.newBlocks.byteSize > 1000000) {
     tooBig = true
     const justRoot = new BlockMap()
-    justRoot.add(commitData.blocks.get(commitData.commit))
-    carSlice = await blocksToCarFile(commitData.commit, justRoot)
+    justRoot.add(commitData.newBlocks.get(commitData.cid))
+    carSlice = await blocksToCarFile(commitData.cid, justRoot)
   } else {
     tooBig = false
     for (const w of writes) {
@@ -68,15 +69,17 @@ export const formatSeqCommit = async (
       }
       ops.push({ action: w.action, path, cid })
     }
-    carSlice = await blocksToCarFile(commitData.commit, commitData.blocks)
+    carSlice = await blocksToCarFile(commitData.cid, commitData.newBlocks)
   }
 
   const evt: CommitEvt = {
     rebase: false,
     tooBig,
     repo: did,
-    commit: commitData.commit,
+    commit: commitData.cid,
     prev: commitData.prev,
+    rev: commitData.rev,
+    since: commitData.since,
     ops,
     blocks: carSlice,
     blobs: blobs.toList(),
@@ -84,30 +87,6 @@ export const formatSeqCommit = async (
   return {
     did,
     eventType: 'append' as const,
-    event: cborEncode(evt),
-    sequencedAt: new Date().toISOString(),
-  }
-}
-
-export const formatSeqRebase = async (
-  did: string,
-  rebaseData: RebaseData,
-): Promise<RepoSeqInsert> => {
-  const carSlice = await blocksToCarFile(rebaseData.commit, rebaseData.blocks)
-
-  const evt: CommitEvt = {
-    rebase: true,
-    tooBig: false,
-    repo: did,
-    commit: rebaseData.commit,
-    prev: rebaseData.rebased,
-    ops: [],
-    blocks: carSlice,
-    blobs: [],
-  }
-  return {
-    did,
-    eventType: 'rebase',
     event: cborEncode(evt),
     sequencedAt: new Date().toISOString(),
   }
@@ -124,6 +103,20 @@ export const formatSeqHandleUpdate = async (
   return {
     did,
     eventType: 'handle',
+    event: cborEncode(evt),
+    sequencedAt: new Date().toISOString(),
+  }
+}
+
+export const formatSeqTombstone = async (
+  did: string,
+): Promise<RepoSeqInsert> => {
+  const evt: TombstoneEvt = {
+    did,
+  }
+  return {
+    did,
+    eventType: 'tombstone',
     event: cborEncode(evt),
     sequencedAt: new Date().toISOString(),
   }
@@ -169,6 +162,8 @@ export const commitEvt = z.object({
   repo: z.string(),
   commit: schema.cid,
   prev: schema.cid.nullable(),
+  rev: z.string(),
+  since: z.string().nullable(),
   blocks: schema.bytes,
   ops: z.array(commitEvtOp),
   blobs: z.array(schema.cid),
@@ -180,6 +175,11 @@ export const handleEvt = z.object({
   handle: z.string(),
 })
 export type HandleEvt = z.infer<typeof handleEvt>
+
+export const tombstoneEvt = z.object({
+  did: z.string(),
+})
+export type TombstoneEvt = z.infer<typeof tombstoneEvt>
 
 type TypedCommitEvt = {
   type: 'commit'
@@ -193,4 +193,10 @@ type TypedHandleEvt = {
   time: string
   evt: HandleEvt
 }
-export type SeqEvt = TypedCommitEvt | TypedHandleEvt
+type TypedTombstoneEvt = {
+  type: 'tombstone'
+  seq: number
+  time: string
+  evt: TombstoneEvt
+}
+export type SeqEvt = TypedCommitEvt | TypedHandleEvt | TypedTombstoneEvt

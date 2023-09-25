@@ -6,27 +6,19 @@ import { AlgoHandler, AlgoResponse } from './types'
 import { FeedKeyset } from '../api/app/bsky/util/feed'
 import { valuesList } from '../db/util'
 
-const NO_WHATS_HOT_LABELS: NotEmptyArray<string> = [
-  '!no-promote',
-  'corpse',
-  'self-harm',
-  'porn',
-  'sexual',
-  'nudity',
-  'underwear',
-]
+const NO_WHATS_HOT_LABELS: NotEmptyArray<string> = ['!no-promote']
 
 const handler: AlgoHandler = async (
   ctx: AppContext,
   params: SkeletonParams,
-  viewer: string,
+  _viewer: string,
 ): Promise<AlgoResponse> => {
   const { limit = 50, cursor } = params
-  const feedService = ctx.services.feed(ctx.db)
+  const db = ctx.db.getReplica('feed')
+  const feedService = ctx.services.feed(db)
 
-  const { ref } = ctx.db.db.dynamic
+  const { ref } = db.db.dynamic
 
-  // @TODO apply blocks and mutes
   const postsQb = feedService
     .selectPostQb()
     .leftJoin('post_agg', 'post_agg.uri', 'post.uri')
@@ -49,10 +41,11 @@ const handler: AlgoHandler = async (
 
   const keyset = new FeedKeyset(ref('sortAt'), ref('cid'))
 
-  let feedQb = ctx.db.db.selectFrom(postsQb.as('feed_items')).selectAll()
+  let feedQb = db.db.selectFrom(postsQb.as('feed_items')).selectAll()
   feedQb = paginate(feedQb, { limit, cursor, keyset })
 
   const feedItems = await feedQb.execute()
+
   return {
     feedItems,
     cursor: keyset.packFromResult(feedItems),

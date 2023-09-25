@@ -20,7 +20,6 @@ describe('proxies appview procedures', () => {
     sc = new SeedClient(agent)
     await basicSeed(sc)
     await network.processAll()
-    agent.api.setHeader('x-appview-proxy', 'true')
     alice = sc.dids.alice
     bob = sc.dids.bob
     carol = sc.dids.carol
@@ -93,6 +92,8 @@ describe('proxies appview procedures', () => {
       },
       sc.getHeaders(carol),
     )
+    await network.processAll()
+
     // mute lists
     await agent.api.app.bsky.graph.muteActorList(
       { list: bobList.uri },
@@ -108,6 +109,7 @@ describe('proxies appview procedures', () => {
         encoding: 'application/json',
       },
     )
+    await network.processAll()
     // check
     const { data: result1 } = await agent.api.app.bsky.graph.getListMutes(
       {},

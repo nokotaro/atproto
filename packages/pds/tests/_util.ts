@@ -1,151 +1,115 @@
 import { AddressInfo } from 'net'
 import os from 'os'
 import path from 'path'
+import getPort from 'get-port'
 import * as crypto from '@atproto/crypto'
-import * as plc from '@did-plc/lib'
 import { PlcServer, Database as PlcDatabase } from '@did-plc/server'
-import { AtUri } from '@atproto/uri'
+import { AtUri } from '@atproto/syntax'
 import { randomStr } from '@atproto/crypto'
+import { uniqueLockId } from '@atproto/dev-env'
 import { CID } from 'multiformats/cid'
-import * as uint8arrays from 'uint8arrays'
-import { PDS, ServerConfig, Database, MemoryBlobStore } from '../src/index'
+import * as ui8 from 'uint8arrays'
+import { PDS, Database } from '../src'
 import { FeedViewPost } from '../src/lexicon/types/app/bsky/feed/defs'
-import DiskBlobStore from '../src/storage/disk-blobstore'
 import AppContext from '../src/context'
-import { DAY, HOUR } from '@atproto/common'
 import { lexToJson } from '@atproto/lexicon'
-import { MountedAlgos } from '../src/feed-gen/types'
+import { ServerEnvironment, envToCfg, envToSecrets } from '../src/config'
 
 const ADMIN_PASSWORD = 'admin-pass'
 const MODERATOR_PASSWORD = 'moderator-pass'
+const TRIAGE_PASSWORD = 'triage-pass'
 
 export type CloseFn = () => Promise<void>
 export type TestServerInfo = {
   url: string
   ctx: AppContext
   close: CloseFn
+  processAll: () => Promise<void>
 }
 
 export type TestServerOpts = {
   migration?: string
-  algos?: MountedAlgos
 }
 
 export const runTestServer = async (
-  params: Partial<ServerConfig> = {},
+  params: Partial<ServerEnvironment> = {},
   opts: TestServerOpts = {},
 ): Promise<TestServerInfo> => {
-  const repoSigningKey = await crypto.Secp256k1Keypair.create()
-  const plcRotationKey = await crypto.Secp256k1Keypair.create()
-
   const dbPostgresUrl = params.dbPostgresUrl || process.env.DB_POSTGRES_URL
-  const dbPostgresSchema =
-    params.dbPostgresSchema || process.env.DB_POSTGRES_SCHEMA
-  // run plc server
 
+  // run plc server
   let plcDb
   if (dbPostgresUrl !== undefined) {
     plcDb = PlcDatabase.postgres({
       url: dbPostgresUrl,
-      schema: `plc_test_${dbPostgresSchema}`,
+      schema: `plc_test_${params.dbPostgresSchema}`,
     })
     await plcDb.migrateToLatestOrThrow()
   } else {
     plcDb = PlcDatabase.mock()
   }
-
   const plcServer = PlcServer.create({ db: plcDb })
   const plcListener = await plcServer.start()
   const plcPort = (plcListener.address() as AddressInfo).port
   const plcUrl = `http://localhost:${plcPort}`
 
-  const recoveryKey = (await crypto.Secp256k1Keypair.create()).did()
-
-  const plcClient = new plc.Client(plcUrl)
-  const serverDid = await plcClient.createDid({
-    signingKey: repoSigningKey.did(),
-    rotationKeys: [recoveryKey, plcRotationKey.did()],
-    handle: 'localhost',
-    pds: 'https://pds.public.url',
-    signer: plcRotationKey,
+  const repoSigningKey = await crypto.Secp256k1Keypair.create({
+    exportable: true,
   })
+  const repoSigningPriv = ui8.toString(await repoSigningKey.export(), 'hex')
+  const plcRotationKey = await crypto.Secp256k1Keypair.create({
+    exportable: true,
+  })
+  const plcRotationPriv = ui8.toString(await plcRotationKey.export(), 'hex')
+  const recoveryKey = (await crypto.Secp256k1Keypair.create()).did()
 
   const blobstoreLoc = path.join(os.tmpdir(), randomStr(5, 'base32'))
 
-  const cfg = new ServerConfig({
-    debugMode: true,
-    version: '0.0.0',
-    scheme: 'http',
-    hostname: 'localhost',
-    serverDid,
-    recoveryKey,
+  const port = await getPort()
+
+  const env: ServerEnvironment = {
+    port,
+    dbPostgresUrl: dbPostgresUrl,
+    dbSqliteLocation: dbPostgresUrl ? undefined : ':memory:',
+    blobstoreDiskLocation: blobstoreLoc,
+    recoveryDidKey: recoveryKey,
+    didPlcUrl: plcUrl,
+    serviceHandleDomains: ['.test'],
+    sequencerLeaderLockId: uniqueLockId(),
+    repoSigningKeyK256PrivateKeyHex: repoSigningPriv,
+    plcRotationKeyK256PrivateKeyHex: plcRotationPriv,
     adminPassword: ADMIN_PASSWORD,
     moderatorPassword: MODERATOR_PASSWORD,
-    inviteRequired: false,
-    userInviteInterval: null,
-    userInviteEpoch: Date.now(),
-    didPlcUrl: plcUrl,
-    didCacheMaxTTL: DAY,
-    didCacheStaleTTL: HOUR,
     jwtSecret: 'jwt-secret',
-    availableUserDomains: ['.test'],
-    appUrlPasswordReset: 'app://forgot-password',
-    emailNoReplyAddress: 'noreply@blueskyweb.xyz',
-    publicUrl: 'https://pds.public.url',
-    imgUriSalt: '9dd04221f5755bce5f55f47464c27e1e',
-    imgUriKey:
-      'f23ecd142835025f42c3db2cf25dd813956c178392760256211f9d315f8ab4d8',
-    dbPostgresUrl: process.env.DB_POSTGRES_URL,
-    blobstoreLocation: `${blobstoreLoc}/blobs`,
-    blobstoreTmp: `${blobstoreLoc}/tmp`,
-    labelerDid: 'did:example:labeler',
-    labelerKeywords: { label_me: 'test-label', label_me_2: 'test-label-2' },
-    feedGenDid: 'did:example:feedGen',
-    maxSubscriptionBuffer: 200,
-    repoBackfillLimitMs: HOUR,
-    sequencerLeaderLockId: uniqueLockId(),
+    inviteRequired: false,
+    inviteEpoch: Date.now(),
+    triagePassword: TRIAGE_PASSWORD,
     ...params,
-  })
+  }
 
-  const db =
-    cfg.dbPostgresUrl !== undefined
-      ? Database.postgres({
-          url: cfg.dbPostgresUrl,
-          schema: cfg.dbPostgresSchema,
-        })
-      : Database.memory()
+  const cfg = envToCfg(env)
+  const secrets = envToSecrets(env)
+
+  const pds = await PDS.create(cfg, secrets)
 
   // Separate migration db on postgres in case migration changes some
   // connection state that we need in the tests, e.g. "alter database ... set ..."
   const migrationDb =
-    cfg.dbPostgresUrl !== undefined
+    cfg.db.dialect === 'pg'
       ? Database.postgres({
-          url: cfg.dbPostgresUrl,
-          schema: cfg.dbPostgresSchema,
+          url: cfg.db.url,
+          schema: cfg.db.schema,
         })
-      : db
+      : pds.ctx.db
   if (opts.migration) {
     await migrationDb.migrateToOrThrow(opts.migration)
   } else {
     await migrationDb.migrateToLatestOrThrow()
   }
-  if (migrationDb !== db) {
+  if (migrationDb !== pds.ctx.db) {
     await migrationDb.close()
   }
 
-  const blobstore =
-    cfg.blobstoreLocation !== undefined
-      ? await DiskBlobStore.create(cfg.blobstoreLocation, cfg.blobstoreTmp)
-      : new MemoryBlobStore()
-
-  const pds = PDS.create({
-    db,
-    blobstore,
-    repoSigningKey,
-    plcRotationKey,
-    config: cfg,
-    algos: opts.algos,
-  })
   const pdsServer = await pds.start()
   const pdsPort = (pdsServer.address() as AddressInfo).port
 
@@ -156,17 +120,10 @@ export const runTestServer = async (
       await pds.destroy()
       await plcServer.destroy()
     },
+    processAll: async () => {
+      await pds.ctx.backgroundQueue.processAll()
+    },
   }
-}
-
-const usedLockIds = new Set()
-const uniqueLockId = () => {
-  let lockId: number
-  do {
-    lockId = 1000 + Math.ceil(1000 * Math.random())
-  } while (usedLockIds.has(lockId))
-  usedLockIds.add(lockId)
-  return lockId
 }
 
 export const adminAuth = () => {
@@ -177,13 +134,14 @@ export const moderatorAuth = () => {
   return basicAuth('admin', MODERATOR_PASSWORD)
 }
 
+export const triageAuth = () => {
+  return basicAuth('admin', TRIAGE_PASSWORD)
+}
+
 const basicAuth = (username: string, password: string) => {
   return (
     'Basic ' +
-    uint8arrays.toString(
-      uint8arrays.fromString(`${username}:${password}`, 'utf8'),
-      'base64pad',
-    )
+    ui8.toString(ui8.fromString(`${username}:${password}`, 'utf8'), 'base64pad')
   )
 }
 
@@ -230,8 +188,12 @@ export const forSnapshot = (obj: unknown) => {
     if (str.match(/^\d+::bafy/)) {
       return constantKeysetCursor
     }
+
+    if (str.match(/^\d+::did:plc/)) {
+      return constantDidCursor
+    }
     if (str.match(/\/image\/[^/]+\/.+\/did:plc:[^/]+\/[^/]+@[\w]+$/)) {
-      // Match image urls
+      // Match image urls (pds)
       const match = str.match(
         /\/image\/([^/]+)\/.+\/(did:plc:[^/]+)\/([^/]+)@[\w]+$/,
       )
@@ -242,7 +204,16 @@ export const forSnapshot = (obj: unknown) => {
         .replace(did, take(users, did))
         .replace(cid, take(cids, cid))
     }
-    if (str.startsWith('pds-public-url-')) {
+    if (str.match(/\/img\/[^/]+\/.+\/did:plc:[^/]+\/[^/]+@[\w]+$/)) {
+      // Match image urls (bsky w/ presets)
+      const match = str.match(
+        /\/img\/[^/]+\/.+\/(did:plc:[^/]+)\/([^/]+)@[\w]+$/,
+      )
+      if (!match) return str
+      const [, did, cid] = match
+      return str.replace(did, take(users, did)).replace(cid, take(cids, cid))
+    }
+    if (str.startsWith('localhost-')) {
       return 'invite-code'
     }
     if (str.match(/^\d+::pds-public-url-/)) {
@@ -298,6 +269,7 @@ export function take(
 
 export const constantDate = new Date(0).toISOString()
 export const constantKeysetCursor = '0000000000000::bafycid'
+export const constantDidCursor = '0000000000000::did'
 
 const mapLeafValues = (obj: unknown, fn: (val: unknown) => unknown) => {
   if (Array.isArray(obj)) {

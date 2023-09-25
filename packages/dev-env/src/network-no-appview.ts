@@ -15,12 +15,16 @@ export class TestNetworkNoAppView {
     const dbPostgresUrl = params.dbPostgresUrl || process.env.DB_POSTGRES_URL
     const dbPostgresSchema =
       params.dbPostgresSchema || process.env.DB_POSTGRES_SCHEMA
+    const dbSqliteLocation =
+      dbPostgresUrl === undefined ? ':memory:' : undefined
 
     const plc = await TestPlc.create(params.plc ?? {})
     const pds = await TestPds.create({
       dbPostgresUrl,
       dbPostgresSchema,
-      plcUrl: plc.url,
+      dbPostgresPoolSize: 5,
+      dbSqliteLocation,
+      didPlcUrl: plc.url,
       ...params.pds,
     })
 
@@ -35,6 +39,10 @@ export class TestNetworkNoAppView {
     const fg = await TestFeedGen.create(this.plc.url, feeds)
     this.feedGens.push(fg)
     return fg
+  }
+
+  async processAll() {
+    await this.pds.processAll()
   }
 
   async close() {

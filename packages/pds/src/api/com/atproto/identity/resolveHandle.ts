@@ -1,6 +1,6 @@
 import { AtpAgent } from '@atproto/api'
 import { InvalidRequestError } from '@atproto/xrpc-server'
-import * as ident from '@atproto/identifier'
+import * as ident from '@atproto/syntax'
 import { Server } from '../../../../lexicon'
 import AppContext from '../../../../context'
 
@@ -23,7 +23,7 @@ export default function (server: Server, ctx: AppContext) {
     if (user) {
       did = user.did
     } else {
-      const supportedHandle = ctx.cfg.availableUserDomains.some(
+      const supportedHandle = ctx.cfg.identity.serviceHandleDomains.some(
         (host) => handle.endsWith(host) || handle === host.slice(1),
       )
       // this should be in our DB & we couldn't find it, so fail
@@ -34,8 +34,8 @@ export default function (server: Server, ctx: AppContext) {
 
     // this is not someone on our server, but we help with resolving anyway
 
-    if (!did && ctx.cfg.bskyAppViewEndpoint) {
-      did = await tryResolveFromAppview(ctx.appviewAgent, handle)
+    if (!did) {
+      did = await tryResolveFromAppview(ctx.appViewAgent, handle)
     }
 
     if (!did) {
